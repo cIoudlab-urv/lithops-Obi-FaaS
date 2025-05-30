@@ -47,6 +47,7 @@ def uuid_str():
 
 def create_executor_id(lenght=6):
     """ Creates an executor ID. """
+
     if '__LITHOPS_SESSION_ID' in os.environ:
         session_id = os.environ['__LITHOPS_SESSION_ID']
     else:
@@ -529,7 +530,7 @@ def verify_args(func, iterdata, extra_args):
     data = format_data(iterdata, extra_args)
 
     # Verify parameters
-    non_verify_args = ['ibm_cos', 'storage', 'id', 'rabbitmq']
+    non_verify_args = ['ibm_cos', 'storage', 'id', 'rabbitmq', 'installed_function']
     func_sig = inspect.signature(func)
 
     new_parameters = list()

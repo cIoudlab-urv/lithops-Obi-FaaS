@@ -24,6 +24,7 @@ import zipfile
 import subprocess
 import botocore.exceptions
 import base64
+import pickle
 
 from botocore.httpsession import URLLib3Session
 from botocore.awsrequest import AWSRequest
@@ -32,6 +33,7 @@ from botocore.auth import SigV4Auth
 from lithops import utils
 from lithops.version import __version__
 from lithops.constants import COMPUTE_CLI_MSG
+from lithops.job.job_installed_function import job_installed_function
 
 from . import config
 
@@ -73,7 +75,8 @@ class AWSLambdaBackend:
         self.lambda_client = self.aws_session.client(
             'lambda', region_name=self.region_name,
             config=botocore.client.Config(
-                user_agent_extra=self.user_agent
+                user_agent_extra=self.user_agent,
+                max_pool_connections=2000
             )
         )
 
@@ -335,12 +338,17 @@ class AWSLambdaBackend:
             msg = 'An error occurred creating/updating action {}: {}'.format(function_name, response)
             raise Exception(msg)
 
-    def build_runtime(self, runtime_name, runtime_file, extra_args=[]):
+    def build_runtime(self, runtime_name, runtime_file, extra_args=[], included_function=job_installed_function):
         """
         Build Lithops container runtime for AWS lambda
         @param runtime_name: name of the runtime to be built
         @param runtime_file: path of a Dockerfile for a container runtime
         """
+        func_str = pickle.dumps(job_installed_function)
+        func_module_str = pickle.dumps({'func': func_str, 'module_data': {}}, -1)
+        with open('func.pickle', 'wb') as f:
+            f.write(func_module_str)
+
         logger.info(f'Building runtime {runtime_name} from {runtime_file}')
 
         docker_path = utils.get_docker_path()
@@ -471,8 +479,20 @@ class AWSLambdaBackend:
                                 'Consider running "lithops runtime build -b aws_lambda ..."')
             image = list(filter(lambda image: 'imageTags' in image and tag in image['imageTags'], images)).pop()
             image_digest = image['imageDigest']
-        except botocore.exceptions.ClientError:
-            raise Exception(f'Runtime "{runtime_name}" is not deployed to ECR')
+        except Exception as e:
+            logger.info(f'Runtime "{runtime_name}" is not deployed to ECR. Building it...')
+            try:
+                self.build_runtime(runtime_name, runtime_file=None)
+                repo_name = self._format_repo_name(image)
+                response = self.ecr_client.describe_images(repositoryName=repo_name)
+                images = response['imageDetails']
+                if not images:
+                    raise Exception(f'Runtime {runtime_name} is not present in ECR.'
+                                    'Consider running "lithops runtime build -b aws_lambda ..."')
+                image = list(filter(lambda image: 'imageTags' in image and tag in image['imageTags'], images)).pop()
+                image_digest = image['imageDigest']
+            except Exception as e:
+                raise Exception(f'An error occurred building the runtime: {e}')
 
         registry = f'{self.account_id}.dkr.ecr.{self.region_name}.amazonaws.com'
         image_uri = f'{registry}/{repo_name}@{image_digest}'
@@ -550,11 +570,37 @@ class AWSLambdaBackend:
         logger.info(f'Deleting lambda runtime: {runtime_name} - {runtime_memory}MB')
         func_name = self._format_function_name(runtime_name, runtime_memory, version)
 
-        self._delete_function(func_name)
+        try:
+            self._delete_function(func_name)
+        except Exception as e:
+            logger.debug(e)
+        runtime_key = self.get_runtime_key(runtime_name, runtime_memory, __version__)
+        self.internal_storage.delete_runtime_meta(runtime_key)
+
+        # Also delete all the runtimes that were extended from this runtime
+        if self.lambda_config.get('runtime_include_function', True):
+            logger.info(f'Deleting lambda extended runtime: {runtime_name} - {runtime_memory}MB')
+            func_name = self._format_function_name(runtime_name+':ext', runtime_memory, version)
+            try:
+                self._delete_function(func_name)
+            except Exception as e:
+                logger.debug(e)
+            runtime_key = self.get_runtime_key(runtime_name+':ext', runtime_memory, __version__)
+            self.internal_storage.delete_runtime_meta(runtime_key)
+
+        # Delete ECR repository
+        if self._is_container_runtime(runtime_name):
+            repo_name = self._format_repo_name(runtime_name)
+            try:
+                self.ecr_client.delete_repository(repositoryName=repo_name, force=True)
+            except Exception as e:
+                logger.debug(f'Error deleting ECR repository: {e}. Skipping deletion.')
 
         if not self._is_container_runtime(runtime_name):
             layer = self._format_layer_name(runtime_name, version)
             self._delete_layer(layer)
+
+
 
     def clean(self, **kwargs):
         """
@@ -668,6 +714,43 @@ class AWSLambdaBackend:
         #         raise Exception('Lithops Runtime: {} not deployed'.format(runtime_name))
         #     else:
         #         raise Exception(response)
+
+
+    def invoke_sync(self, runtime_name, runtime_memory, payload):
+        """
+        Invoke lambda function asynchronously
+        @param runtime_name: name of the runtime
+        @param runtime_memory: memory of the runtime in MB
+        @param payload: invoke dict payload
+        @return: invocation ID
+        """
+        # print("Starting invocation", payload)
+        function_name = self._format_function_name(runtime_name, runtime_memory)
+        payload['sync_invoker'] = True
+        # return None
+        # Save payload into json file
+        payload = json.dumps(payload, default=str)
+        print("Payload", payload)
+        try:
+            response = self.lambda_client.invoke(
+                FunctionName=function_name,
+                Payload=payload
+            )
+            if response['StatusCode'] == 200:
+                return json.loads(response['Payload'].read().decode('utf-8'))
+            else:
+                logger.debug(response)
+                if response['ResponseMetadata']['HTTPStatusCode'] == 401:
+                    raise Exception('Unauthorized - Invalid API Key')
+                elif response['ResponseMetadata']['HTTPStatusCode'] == 404:
+                    raise Exception('Lithops Runtime: {} not deployed'.format(runtime_name))
+                else:
+                    raise Exception(response)
+        except Exception as e:
+            # Reached the maximum number of attempts, raise an exception or perform any other action
+            raise Exception(f"Failed to invoke function: {e}")
+
+
 
     def get_runtime_key(self, runtime_name, runtime_memory, version=__version__):
         """

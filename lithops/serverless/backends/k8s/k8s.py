@@ -25,6 +25,8 @@ import copy
 import time
 import yaml
 import urllib3
+import pickle
+
 from kubernetes import client, watch
 from kubernetes.config import load_kube_config, \
     load_incluster_config, list_kube_config_contexts, \
@@ -34,6 +36,7 @@ from kubernetes.client.rest import ApiException
 from lithops import utils
 from lithops.version import __version__
 from lithops.constants import COMPUTE_CLI_MSG, JOBS_PREFIX
+from lithops.job.job_installed_function import job_installed_function
 
 from . import config
 
@@ -124,10 +127,15 @@ class KubernetesBackend:
             self.name, self.k8s_config, 'lithops-kubernetes-default'
         )
 
-    def build_runtime(self, docker_image_name, dockerfile, extra_args=[]):
+    def build_runtime(self, docker_image_name, dockerfile, extra_args=[], included_function=job_installed_function):
         """
         Builds a new runtime from a Docker file and pushes it to the registry
         """
+        func_str = pickle.dumps(job_installed_function)
+        func_module_str = pickle.dumps({'func': func_str, 'module_data': {}}, -1)
+        with open('func.pickle', 'wb') as f:
+            f.write(func_module_str)
+
         logger.info(f'Building runtime {docker_image_name} from {dockerfile or "Dockerfile"}')
 
         docker_path = utils.get_docker_path()
@@ -246,7 +254,56 @@ class KubernetesBackend:
         """
         Deletes a runtime
         """
-        pass
+        job_name_pattern = self._format_job_name(docker_image_name, memory, version)
+
+        docker_path = utils.get_docker_path()
+        docker_user = self.k8s_config.get("docker_user")
+        docker_password = self.k8s_config.get("docker_password")
+        docker_server = self.k8s_config.get("docker_server")
+
+        if docker_user and docker_password:
+            logger.debug('Container registry credentials found in config. Logging in into the registry')
+            cmd = f'{docker_path} login -u {docker_user} --password-stdin {docker_server}'
+            utils.run_command(cmd, input=docker_password)
+
+
+        logger.info(f'Deleting Docker image {docker_image_name} in remote')
+        cmd = f'{docker_path} image rm {docker_image_name}'
+
+        try:
+            utils.run_command(cmd)
+            logger.info(f'Removed Docker image {docker_image_name} in remote')
+        except Exception as e:
+            logger.error(f"Failed to delete image: {docker_image_name} in remote")
+
+        logger.info(f"Deleting runtime: {docker_image_name} locally")
+        cmd = f'{docker_path} rmi {docker_image_name}'
+        try:
+            utils.run_command(cmd)
+            logger.info(f'Removed Docker image {docker_image_name} locally')
+        except Exception as e:
+            logger.error(f"Failed to delete image: {docker_image_name} locally")
+
+        # Delete the Kubernetes Deployment
+        try:
+            logger.debug(f"Deleting job: {job_name_pattern}")
+            self.batch_api.delete_namespaced_job(
+                name=job_name_pattern,
+                namespace=self.namespace,
+                propagation_policy='Background'
+            )
+        except ApiException as e:
+            logger.error(f"Failed to delete job: {job_name_pattern}. Reason: {str(e)}")
+
+        # 2. Delete the container registry secret
+        try:
+            logger.debug("Deleting container registry secret")
+            self.core_api.delete_namespaced_secret("lithops-regcred", self.namespace)
+        except ApiException as e:
+            if e.status != 404:
+                logger.error(f"Failed to delete secret: lithops-regcred. Reason: {str(e)}")
+
+
 
     def clean(self, all=False):
         """
@@ -307,7 +364,7 @@ class KubernetesBackend:
         logger.debug('Note that this backend does not manage runtimes')
         return []
 
-    def _create_pod(self, pod, pod_name, cpu, memory):
+    def _create_pod(self, pod, pod_name, cpu, memory, gpu=False):
         pod["metadata"]["name"] = f"lithops-pod-{pod_name}"
         node_name = re.sub(r'-\d+$', '', pod_name)
         pod["spec"]["nodeName"] = node_name
@@ -315,6 +372,10 @@ class KubernetesBackend:
         pod["spec"]["containers"][0]["resources"]["requests"]["cpu"] = str(cpu)
         pod["spec"]["containers"][0]["resources"]["requests"]["memory"] = memory
         pod["metadata"]["labels"] = {"app": "lithops-pod"}
+
+        # Add GPU resource request if GPU is enabled
+        if gpu:
+            pod["spec"]["containers"][0]["resources"]["requests"]["nvidia.com/gpu"] = str(gpu)
 
         payload = {
             'log_level': 'DEBUG',
@@ -445,6 +506,7 @@ class KubernetesBackend:
         master_res['metadata']['namespace'] = self.namespace
         master_res['metadata']['labels']['version'] = 'lithops_v' + __version__
         master_res['metadata']['labels']['user'] = self.user
+        master_res['spec']['template']['spec']['containers'][0]['resources'] = config.MASTER_CONFIG_RESOURCES
 
         container = master_res['spec']['template']['spec']['containers'][0]
         container['image'] = docker_image_name
@@ -639,7 +701,7 @@ class KubernetesBackend:
         return activation_id
 
     def _generate_runtime_meta(self, docker_image_name):
-        runtime_name = self._format_job_name(docker_image_name, 128)
+        runtime_name = self._format_job_name(docker_image_name, 512)
         meta_job_name = f'{runtime_name}-meta'
 
         logger.info(f"Extracting metadata from: {docker_image_name}")
@@ -728,7 +790,7 @@ class KubernetesBackend:
         Runtime keys are used to uniquely identify runtimes within the storage,
         in order to know which runtimes are installed and which not.
         """
-        jobdef_name = self._format_job_name(docker_image_name, 256, version)
+        jobdef_name = self._format_job_name(docker_image_name, 512, version)
         user_data = os.path.join(self.cluster, self.namespace, self.user)
         runtime_key = os.path.join(self.name, version, user_data, jobdef_name)
 
